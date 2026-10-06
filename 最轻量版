@@ -1,0 +1,434 @@
+local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local PG = game.Players.LocalPlayer:WaitForChild("PlayerGui")
+
+local API = "https://api.deepseek.com/chat/completions"
+local KEY = ""
+local MODEL = "deepseek-flash"
+
+local SYS = [[
+你是 Roblox Luau Agent，运行在执行器环境。用最少的步骤把用户交代的事做完。
+
+【工具】
+▶ run_code   {"code": "完整 Luau"}
+▶ read_file  {"path": "路径"}
+▶ write_file {"path": "路径", "content": "内容"}
+▶ search_file {"keyword": "关键词", "root": "."}
+▶ list_dir   {"path": "路径"}
+
+【调用格式】
+TOOL: 工具名
+ARGS: {"参数": "值"}
+END
+
+【提取代码】
+用户说"提取脚本"、"给我代码"时输出：
+START
+<代码>
+END
+
+═══════════════════════════════════════
+【你自己的 UI 结构】—— 你可以修改自己
+═══════════════════════════════════════
+你现在有一个 UI 界面，位于 PlayerGui.CodexLite，结构如下：
+
+CodexLite (ScreenGui)
+└── Main (Frame)  ← 主窗口，Size 400x340，圆角 12
+    ├── TitleBar (Frame)  标题栏，可拖动
+    │   ├── Dot (Frame)   状态点（绿/黄/红）
+    │   ├── Title (TextLabel)  "Codex Agent"
+    │   ├── Status (TextLabel)  状态文字
+    │   └── CloseBtn (TextButton)  "×"
+    ├── KeyRow (Frame)  API Key 输入区
+    │   ├── KeyBox (TextBox)
+    │   └── ModelBtn (TextButton)  模型切换
+    ├── Log (ScrollingFrame)  消息显示区
+    ├── InputRow (Frame)
+    │   ├── Input (TextBox)
+    │   └── SendBtn (TextButton)  "↑"
+    └── Conv (Folder)  对话历史（不要动）
+
+配色变量（在脚本里）：
+- C.bg      深色背景
+- C.panel   面板色
+- C.accent  蓝色主色
+- C.text    白色文字
+- C.muted   灰色次要文字
+
+当用户说"把 UI 改成 XX"、"颜色变 XX"、"窗口大一点/小一点"、"加个按钮"等，
+你直接调 run_code 用 game.Players.LocalPlayer.PlayerGui.CodexLite 拿到 UI，
+改对应的 Frame/TextLabel 的属性，或者用 Instance.new 加新元素。
+不要重新写整个 UI，只改需要改的部分。
+修改完用一句中文总结改了什么。
+]]
+
+local TOOLS = {}
+local function sanitize(s)
+    if type(s) ~= "string" then s = tostring(s) end
+    s = s:gsub("[%z\1-\8\11\12\14-\31]", "")
+    if #s > 2000 then s = s:sub(1, 2000) .. "...[截断]" end
+    return s
+end
+
+TOOLS.run_code = function(a)
+    local fn, err = loadstring(a.code or "")
+    if not fn then return "编译失败: " .. tostring(err) end
+    local ok, res = pcall(fn)
+    return ok and ("成功: " .. tostring(res or "ok")) or ("失败: " .. tostring(res))
+end
+TOOLS.read_file = function(a)
+    if not readfile then return "不支持 readfile" end
+    local ok, c = pcall(readfile, a.path)
+    if not ok then return "失败: " .. tostring(c) end
+    return sanitize(c)
+end
+TOOLS.write_file = function(a)
+    if not writefile then return "不支持 writefile" end
+    local ok, e = pcall(writefile, a.path, a.content)
+    return ok and ("写入成功: " .. a.path) or ("失败: " .. tostring(e))
+end
+TOOLS.search_file = function(a)
+    if not listfiles then return "不支持 listfiles" end
+    local r = {}
+    local ok, fs = pcall(listfiles, a.root or ".")
+    if not ok then return "搜索失败" end
+    for _, f in ipairs(fs) do
+        if f:lower():find((a.keyword or ""):lower(), 1, true) then
+            table.insert(r, f)
+        end
+        if #r >= 30 then break end
+    end
+    return #r > 0 and sanitize(table.concat(r, "\n")) or "未找到"
+end
+TOOLS.list_dir = function(a)
+    if not listfiles then return "不支持 listfiles" end
+    local ok, fs = pcall(listfiles, a.path or ".")
+    return ok and sanitize(table.concat(fs, "\n")) or "列目录失败"
+end
+
+local C = {
+    bg      = Color3.fromRGB(18, 20, 28),
+    panel   = Color3.fromRGB(24, 27, 37),
+    panel2  = Color3.fromRGB(32, 36, 48),
+    border  = Color3.fromRGB(56, 62, 80),
+    text    = Color3.fromRGB(240, 242, 250),
+    muted   = Color3.fromRGB(140, 148, 168),
+    accent  = Color3.fromRGB(120, 150, 255),
+    accent2 = Color3.fromRGB(170, 190, 255),
+    green   = Color3.fromRGB(108, 211, 157),
+    red     = Color3.fromRGB(255, 120, 120),
+    yellow  = Color3.fromRGB(255, 200, 100),
+    blue    = Color3.fromRGB(140, 200, 255),
+}
+
+local g = Instance.new("ScreenGui", PG)
+g.Name = "CodexLite"
+g.ResetOnSpawn = false
+g.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+-- 主窗口：从 500x400 缩到 400x340
+local f = Instance.new("Frame", g)
+f.Name = "Main"
+f.Size = UDim2.fromOffset(400, 340)
+f.Position = UDim2.fromScale(0.5, 0.5)
+f.AnchorPoint = Vector2.new(0.5, 0.5)
+f.BackgroundColor3 = C.bg
+f.BorderSizePixel = 0
+f.Active = true
+Instance.new("UICorner", f).CornerRadius = UDim.new(0, 10)
+Instance.new("UIStroke", f).Color = C.border
+
+-- 标题栏
+local bar = Instance.new("Frame", f)
+bar.Name = "TitleBar"
+bar.Size = UDim2.new(1, 0, 0, 34)
+bar.BackgroundColor3 = C.panel
+bar.BorderSizePixel = 0
+Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 10)
+
+local fix = Instance.new("Frame", bar)
+fix.Size = UDim2.new(1, 0, 0, 10)
+fix.Position = UDim2.new(0, 0, 1, -10)
+fix.BackgroundColor3 = C.panel
+fix.BorderSizePixel = 0
+
+local dot = Instance.new("Frame", bar)
+dot.Name = "Dot"
+dot.Size = UDim2.fromOffset(7, 7)
+dot.Position = UDim2.new(0, 12, 0.5, -3)
+dot.BackgroundColor3 = C.green
+dot.BorderSizePixel = 0
+Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+local title = Instance.new("TextLabel", bar)
+title.Name = "Title"
+title.Size = UDim2.fromOffset(200, 34)
+title.Position = UDim2.fromOffset(24, 0)
+title.BackgroundTransparency = 1
+title.Text = "Codex Agent"
+title.TextColor3 = C.text
+title.TextSize = 12
+title.Font = Enum.Font.SourceSansBold
+title.TextXAlignment = Enum.TextXAlignment.Left
+
+local status = Instance.new("TextLabel", bar)
+status.Name = "Status"
+status.Size = UDim2.fromOffset(100, 34)
+status.Position = UDim2.new(1, -140, 0, 0)
+status.BackgroundTransparency = 1
+status.Text = "ready"
+status.TextColor3 = C.muted
+status.TextSize = 9
+status.Font = Enum.Font.Code
+status.TextXAlignment = Enum.TextXAlignment.Right
+
+local close = Instance.new("TextButton", bar)
+close.Name = "CloseBtn"
+close.Size = UDim2.fromOffset(24, 24)
+close.Position = UDim2.new(1, -30, 0.5, -12)
+close.BackgroundColor3 = C.panel2
+close.Text = "×"
+close.TextColor3 = C.muted
+close.TextSize = 14
+close.Font = Enum.Font.SourceSansBold
+close.AutoButtonColor = false
+close.BorderSizePixel = 0
+Instance.new("UICorner", close).CornerRadius = UDim.new(0, 6)
+close.MouseButton1Click:Connect(function() g:Destroy() end)
+
+-- 拖动
+local drag, ds, sp
+bar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        drag = true; ds = input.Position; sp = f.Position
+    end
+end)
+bar.InputChanged:Connect(function(input)
+    if drag and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        local d = input.Position - ds
+        f.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X, sp.Y.Scale, sp.Y.Offset + d.Y)
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        drag = false
+    end
+end)
+
+-- Key 行
+local keyRow = Instance.new("Frame", f)
+keyRow.Name = "KeyRow"
+keyRow.Size = UDim2.new(1, -16, 0, 30)
+keyRow.Position = UDim2.fromOffset(8, 42)
+keyRow.BackgroundColor3 = C.panel
+keyRow.BorderSizePixel = 0
+Instance.new("UICorner", keyRow).CornerRadius = UDim.new(0, 7)
+
+local keyBox = Instance.new("TextBox", keyRow)
+keyBox.Name = "KeyBox"
+keyBox.Size = UDim2.new(1, -90, 1, 0)
+keyBox.Position = UDim2.fromOffset(10, 0)
+keyBox.BackgroundTransparency = 1
+keyBox.TextColor3 = C.text
+keyBox.PlaceholderText = "API Key"
+keyBox.PlaceholderColor3 = C.muted
+keyBox.Text = KEY
+keyBox.TextSize = 10
+keyBox.Font = Enum.Font.Code
+keyBox.TextXAlignment = Enum.TextXAlignment.Left
+keyBox.ClearTextOnFocus = false
+
+local modelBtn = Instance.new("TextButton", keyRow)
+modelBtn.Name = "ModelBtn"
+modelBtn.Size = UDim2.fromOffset(72, 22)
+modelBtn.Position = UDim2.new(1, -78, 0.5, -11)
+modelBtn.BackgroundColor3 = C.panel2
+modelBtn.Text = MODEL
+modelBtn.TextColor3 = C.text
+modelBtn.TextSize = 9
+modelBtn.Font = Enum.Font.Code
+modelBtn.AutoButtonColor = false
+modelBtn.BorderSizePixel = 0
+Instance.new("UICorner", modelBtn).CornerRadius = UDim.new(0, 5)
+modelBtn.MouseButton1Click:Connect(function()
+    MODEL = (MODEL == "deepseek-flash") and "deepseek-v4-pro" or "deepseek-flash"
+    modelBtn.Text = MODEL
+end)
+
+-- 日志
+local log = Instance.new("ScrollingFrame", f)
+log.Name = "Log"
+log.Size = UDim2.new(1, -16, 1, -160)
+log.Position = UDim2.fromOffset(8, 80)
+log.BackgroundColor3 = C.panel
+log.BorderSizePixel = 0
+log.CanvasSize = UDim2.new()
+log.AutomaticCanvasSize = Enum.AutomaticSize.Y
+log.ScrollBarThickness = 3
+log.ScrollBarImageColor3 = C.border
+Instance.new("UICorner", log).CornerRadius = UDim.new(0, 7)
+
+local layout = Instance.new("UIListLayout", log)
+layout.Padding = UDim.new(0, 5)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local pad = Instance.new("UIPadding", log)
+pad.PaddingTop = UDim.new(0, 6)
+pad.PaddingBottom = UDim.new(0, 6)
+pad.PaddingLeft = UDim.new(0, 6)
+pad.PaddingRight = UDim.new(0, 6)
+
+-- 输入区
+local inputRow = Instance.new("Frame", f)
+inputRow.Name = "InputRow"
+inputRow.Size = UDim2.new(1, -16, 0, 36)
+inputRow.Position = UDim2.new(0, 8, 1, -44)
+inputRow.BackgroundColor3 = C.panel
+inputRow.BorderSizePixel = 0
+Instance.new("UICorner", inputRow).CornerRadius = UDim.new(0, 7)
+Instance.new("UIStroke", inputRow).Color = C.border
+Instance.new("UIStroke", inputRow).Transparency = 0.5
+
+local box = Instance.new("TextBox", inputRow)
+box.Name = "Input"
+box.Size = UDim2.new(1, -50, 1, 0)
+box.Position = UDim2.fromOffset(10, 0)
+box.BackgroundTransparency = 1
+box.TextColor3 = C.text
+box.PlaceholderText = "输入任务..."
+box.PlaceholderColor3 = C.muted
+box.Text = ""
+box.TextSize = 11
+box.Font = Enum.Font.SourceSans
+box.TextXAlignment = Enum.TextXAlignment.Left
+box.ClearTextOnFocus = false
+
+local send = Instance.new("TextButton", inputRow)
+send.Name = "SendBtn"
+send.Size = UDim2.fromOffset(28, 28)
+send.Position = UDim2.new(1, -34, 0.5, -14)
+send.BackgroundColor3 = C.accent
+send.Text = "↑"
+send.TextColor3 = C.bg
+send.TextSize = 14
+send.Font = Enum.Font.SourceSansBold
+send.AutoButtonColor = false
+send.BorderSizePixel = 0
+Instance.new("UICorner", send).CornerRadius = UDim.new(1, 0)
+
+-- 对话历史容器（给 AI 参考用，实际对话在上面 log 里显示）
+local convFolder = Instance.new("Folder", f)
+convFolder.Name = "Conv"
+
+local conv = {{role = "system", content = SYS}}
+local running = false
+
+local function setStatus(text, color)
+    status.Text = text
+    status.TextColor3 = color or C.muted
+    dot.BackgroundColor3 = color or C.green
+end
+
+local function say(text, color)
+    local l = Instance.new("TextLabel", log)
+    l.Size = UDim2.new(1, 0, 0, 0)
+    l.AutomaticSize = Enum.AutomaticSize.Y
+    l.BackgroundTransparency = 1
+    l.Text = text
+    l.TextColor3 = color or C.text
+    l.TextSize = 11
+    l.Font = Enum.Font.SourceSans
+    l.TextWrapped = true
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextYAlignment = Enum.TextYAlignment.Top
+    l.LayoutOrder = #log:GetChildren()
+    task.defer(function()
+        log.CanvasPosition = Vector2.new(0, log.AbsoluteCanvasSize.Y)
+    end)
+end
+
+local function parseTool(t)
+    t = t:gsub("```%w*\n", ""):gsub("```", "")
+    local tool = t:match("[Tt][Oo][Oo][Ll]:%s*([%w_]+)")
+    local args = t:match("[Aa][Rr][Gg][Ss]:%s*(%b{})")
+    if tool and args then
+        local ok, a = pcall(HttpService.JSONDecode, HttpService, args)
+        if ok then return tool, a end
+    end
+    return nil, nil
+end
+
+local function run()
+    if running then return end
+    KEY = keyBox.Text:gsub("%s", "")
+    if KEY == "" then
+        say("请先填 API Key", C.red)
+        setStatus("缺少 Key", C.red)
+        return
+    end
+    local q = box.Text
+    if q == "" then return end
+    box.Text = ""
+    say("你: " .. q, C.accent2)
+    table.insert(conv, {role = "user", content = q})
+    running = true
+    setStatus("思考中", C.yellow)
+
+    task.spawn(function()
+        for i = 1, 15 do
+            local ok, res = pcall(function()
+                return request({
+                    Url = API, Method = "POST",
+                    Headers = {
+                        ["Content-Type"] = "application/json",
+                        ["Authorization"] = "Bearer " .. KEY,
+                    },
+                    Body = HttpService:JSONEncode({
+                        model = MODEL,
+                        messages = conv,
+                        temperature = 0.3,
+                    }),
+                })
+            end)
+            if not ok or res.StatusCode ~= 200 then
+                say("请求失败: " .. tostring(ok and res.Body or res), C.red)
+                setStatus("失败", C.red)
+                running = false
+                return
+            end
+            local reply = HttpService:JSONDecode(res.Body).choices[1].message.content
+            table.insert(conv, {role = "assistant", content = reply})
+            local tool, a = parseTool(reply)
+            if tool and TOOLS[tool] then
+                setStatus("执行 " .. tool, C.yellow)
+                local result = TOOLS[tool](a)
+                say("工具 " .. tool .. ": " .. sanitize(result):sub(1, 150), C.blue)
+                table.insert(conv, {role = "user", content = tool .. " 返回: " .. sanitize(result)})
+            else
+                local code = reply:match("START%s*\n(.-)\n%s*END")
+                if code then
+                    say("代码:\n" .. code, C.green)
+                else
+                    say("AI: " .. reply)
+                end
+                setStatus("ready", C.green)
+                running = false
+                return
+            end
+        end
+        say("达到循环上限", C.yellow)
+        setStatus("上限", C.yellow)
+        running = false
+    end)
+end
+
+send.MouseButton1Click:Connect(run)
+send.Activated:Connect(run)
+box.FocusLost:Connect(function(e) if e then run() end end)
+
+say("Agent 已启动")
+setStatus("ready", C.green)
